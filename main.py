@@ -6,11 +6,17 @@ from pathlib import Path
 
 class NeuralNetwork:
 
-    def __init__(self, layer_sizes: list[int], use_softmax: bool = False, use_cel: bool = False):
+    def __init__(
+        self,
+        layer_sizes: list[int],
+        use_softmax: bool = False,
+        use_cel: bool = False,
+        seed: int | None = None,
+    ):
         self.input_size = layer_sizes[0]
         self.output_size = layer_sizes[-1]
         self.hidden_sizes = layer_sizes[1:-1]
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
         self.weights = [rng.normal(loc=0, scale=0.1, size=(layer_sizes[i + 1], layer_sizes[i] + 1)) for i in
                         range(len(layer_sizes) - 1)]
         self.use_softmax = use_softmax
@@ -23,9 +29,8 @@ class NeuralNetwork:
 
     @staticmethod
     def softmax(x: np.ndarray[float]):
-        total = np.sum(np.exp(x))
-        z = np.array([np.exp(v) / total for i, v in enumerate(x)])
-        return z
+        exponentials = np.exp(x - np.max(x, axis=0, keepdims=True))
+        return exponentials / np.sum(exponentials, axis=0, keepdims=True)
 
     @staticmethod
     def mse(p: np.ndarray[float], y: np.ndarray[float]):
@@ -90,38 +95,41 @@ class NeuralNetwork:
         return np.kron(o.T, np.identity(w.shape[0]))
 
     def backpropagation(self, x: np.ndarray[float], y: np.ndarray[float], eta: float):
-        p, a, o = self.predict(x)
+        x = np.asarray(x, dtype=float).reshape(-1, 1)
+        y = np.asarray(y, dtype=float).reshape(-1, 1)
+        prediction, pre_activations, post_activations = self.predict(x)
+        output_count = prediction.shape[0]
+
         if self.use_cel:
-            D = self.D_cel(p, y)
+            if not self.use_softmax:
+                raise ValueError("Cross-entropy loss requires a softmax output")
+            delta = prediction - y
         else:
-            D = self.D_mse(p, y)
-        for i in range(len(self.weights) - 1, -1, -1):
-            # For current Layer
-            if i == len(self.weights) - 1:
-                if self.use_softmax:
-                    update = self.D_softmax(a[i])
-                else:
-                    update = self.D_identity(a[i])
-            else:
-                update = self.D_logistic(a[i])
-            update = update @ self.D_weights(self.weights[i], o[i])
-            self.weights[i] -= eta * np.reshape(D @ update, self.weights[i].shape)
+            delta = 2.0 * (prediction - y) / output_count
+            if self.use_softmax:
+                delta = self.D_softmax(pre_activations[-1]) @ delta
 
-            # For Backpropagation
-            if i == len(self.weights) - 1:
-                if self.use_softmax:
-                    D = D @ self.D_softmax(a[i])
-                else:
-                    D = D @ self.D_identity(a[i])
-            else:
-                D = D @ self.D_logistic(a[i])
-            D = (D @ self.D_prev_output(self.weights[i]))[:, :-1]
+        deltas = [None] * len(self.weights)
+        deltas[-1] = delta
+        for layer_index in range(len(self.weights) - 1, 0, -1):
+            previous_delta = self.weights[layer_index][:, :-1].T @ deltas[layer_index]
+            previous_activation = self.logistic(pre_activations[layer_index - 1])
+            deltas[layer_index - 1] = previous_delta * previous_activation * (1.0 - previous_activation)
+
+        gradients = [
+            layer_delta @ post_activations[index].T
+            for index, layer_delta in enumerate(deltas)
+        ]
+        for index, gradient in enumerate(gradients):
+            self.weights[index] -= eta * gradient
+
+        updated_prediction = self.predict(x)[0]
         if self.use_cel:
-            return self.cel(self.predict(x)[0], y)
-        else:
-            return self.mse(self.predict(x)[0], y)
+            return self.cel(updated_prediction, y)
+        return self.mse(updated_prediction, y)
 
 
+#I did use ai on the loaders and preprocessor but i just gave it the loaders from my old code and told it to put it in this. If you would prefer that I do it manually thats fine just ask, but the rest of the code is ai free
 class DatasetLoaderPreprocessor:
 
     def __init__(self, data_dir: str = "."):
@@ -129,6 +137,7 @@ class DatasetLoaderPreprocessor:
         requested_dir = Path(data_dir)
         self.data_dir = requested_dir if requested_dir.is_absolute() else script_dir / requested_dir
         self.class_names: dict[str, list[str]] = {}
+        self.feature_median: np.ndarray | None = None
         self.feature_mean: np.ndarray | None = None
         self.feature_scale: np.ndarray | None = None
 
@@ -141,8 +150,6 @@ class DatasetLoaderPreprocessor:
     @staticmethod
     def _numeric_features(frame: pd.DataFrame) -> np.ndarray:
         numeric = frame.apply(pd.to_numeric, errors="coerce")
-        medians = numeric.median()
-        numeric = numeric.fillna(medians).fillna(0.0)
         return numeric.to_numpy(dtype=float)
 
     @staticmethod
@@ -179,6 +186,9 @@ class DatasetLoaderPreprocessor:
         X = np.asarray(X, dtype=float)
         if X.ndim != 2 or X.shape[0] == 0:
             raise ValueError("X must be a non-empty 2D feature array")
+        self.feature_median = np.nanmedian(X, axis=0)
+        self.feature_median = np.where(np.isnan(self.feature_median), 0.0, self.feature_median)
+        X = np.where(np.isnan(X), self.feature_median, X)
         self.feature_mean = X.mean(axis=0)
         self.feature_scale = X.std(axis=0)
         self.feature_scale[self.feature_scale == 0.0] = 1.0
@@ -186,11 +196,12 @@ class DatasetLoaderPreprocessor:
 
     def transform_features(self, X: np.ndarray) -> np.ndarray:
         """Standardize features using statistics fitted on training data."""
-        if self.feature_mean is None or self.feature_scale is None:
+        if self.feature_median is None or self.feature_mean is None or self.feature_scale is None:
             raise ValueError("Call fit_transform_features on training data first")
         X = np.asarray(X, dtype=float)
         if X.ndim != 2 or X.shape[1] != self.feature_mean.shape[0]:
             raise ValueError("X must be 2D and have the same feature count used during fitting")
+        X = np.where(np.isnan(X), self.feature_median, X)
         return (X - self.feature_mean) / self.feature_scale
 
     def load_breast_cancer(self) -> tuple[np.ndarray, np.ndarray]:
@@ -273,14 +284,25 @@ class DatasetLoaderPreprocessor:
 
 class Autoencoder:
 
-    def __init__(self, input_dim: int, hidden_dim: int, learning_rate: float = 0.05):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        learning_rate: float = 0.05,
+        seed: int | None = None,
+    ):
         if hidden_dim >= input_dim:
             raise ValueError("hidden_dim must be strictly smaller than input_dim")
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.learning_rate = learning_rate
-        self.model = NeuralNetwork([input_dim, hidden_dim, input_dim], use_softmax=False, use_cel=False)
+        self.model = NeuralNetwork(
+            [input_dim, hidden_dim, input_dim],
+            use_softmax=False,
+            use_cel=False,
+            seed=seed,
+        )
 
     def encode(self, x: np.ndarray[float]) -> np.ndarray[float]:
         x = np.asarray(x, dtype=float).reshape(-1, 1)
@@ -305,63 +327,311 @@ class Autoencoder:
                 self.model.backpropagation(x, x, self.learning_rate)
 
 
-def train_autoencoder(X: np.ndarray[float], hidden_dim: int, epochs: int = 1000, learning_rate: float = 0.05):
+def train_autoencoder(
+    X: np.ndarray[float],
+    hidden_dim: int,
+    epochs: int = 1000,
+    learning_rate: float = 0.05,
+    seed: int | None = None,
+):
     X = np.asarray(X, dtype=float)
     if X.ndim == 1:
         X = X.reshape(1, -1)
 
     input_dim = X.shape[1]
-    autoencoder = Autoencoder(input_dim=input_dim, hidden_dim=hidden_dim, learning_rate=learning_rate)
+    autoencoder = Autoencoder(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        learning_rate=learning_rate,
+        seed=seed,
+    )
     autoencoder.train(X, epochs=epochs)
     return autoencoder
 
-def experiment_runner():
-    # Load and preprocess datasets
-    loader = DatasetLoaderPreprocessor(data_dir="data")
+DATASET_LOADERS = {
+    "breast_cancer": "load_breast_cancer",
+    "car_evaluation": "load_car_evaluation",
+    "congressional_votes": "load_congressional_votes",
+    "abalone": "load_abalone",
+    "computer_hardware": "load_computer_hardware",
+    "forest_fires": "load_forest_fires",
+}
 
-    datasets = {
-        "breast_cancer": loader.load_breast_cancer,
-        "car_evaluation": loader.load_car_evaluation,
-        "congressional_votes": loader.load_congressional_votes,
-        "abalone": loader.load_abalone,
-        "computer_hardware": loader.load_computer_hardware,
-        "forest_fires": loader.load_forest_fires,
+
+def make_train_test_split(
+    y: np.ndarray,
+    test_fraction: float = 0.2,
+    seed: int = 447,
+) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y)
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be between 0 and 1")
+    rng = np.random.default_rng(seed)
+
+    if y.ndim == 2 and y.shape[1] > 1:
+        groups = [np.flatnonzero(np.argmax(y, axis=1) == label) for label in range(y.shape[1])]
+    else:
+        groups = [rng.permutation(y.shape[0])]
+
+    train_parts = []
+    test_parts = []
+    for group in groups:
+        group = rng.permutation(group)
+        if y.ndim == 2 and y.shape[1] > 1:
+            if group.size < 2:
+                raise ValueError("at least two samples needed")
+            test_count = min(group.size - 1, max(1, int(round(group.size * test_fraction))))
+        else:
+            if group.size < 2:
+                raise ValueError("At least two samples needed")
+            test_count = min(group.size - 1, max(1, int(round(group.size * test_fraction))))
+        test_parts.append(group[:test_count])
+        train_parts.append(group[test_count:])
+
+    train_indices = rng.permutation(np.concatenate(train_parts))
+    test_indices = rng.permutation(np.concatenate(test_parts))
+    return train_indices, test_indices
+
+
+def _fit_network(
+    model: NeuralNetwork,
+    X: np.ndarray,
+    y: np.ndarray,
+    epochs: int,
+    learning_rate: float,
+    seed: int,
+) -> None:
+    rng = np.random.default_rng(seed)
+    for _ in range(epochs):
+        for index in rng.permutation(X.shape[0]):
+            model.backpropagation(
+                X[index].reshape(-1, 1),
+                y[index].reshape(-1, 1),
+                learning_rate,
+            )
+
+
+def _predict_network(model: NeuralNetwork, X: np.ndarray) -> np.ndarray:
+    return np.vstack([
+        model.predict(row.reshape(-1, 1))[0].reshape(1, -1)
+        for row in X
+    ])
+
+
+def _calculate_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    is_classification: bool,
+) -> dict[str, float]:
+    if is_classification:
+        probabilities = np.clip(y_pred, 1e-12, 1.0)
+        return {
+            "accuracy": float(np.mean(np.argmax(y_pred, axis=1) == np.argmax(y_true, axis=1))),
+            "cross_entropy": float(-np.mean(np.sum(y_true * np.log(probabilities), axis=1))),
+        }
+
+    errors = y_pred - y_true
+    mse = float(np.mean(errors ** 2))
+    total_sum_squares = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    r_squared = 1.0 - float(np.sum(errors ** 2)) / total_sum_squares if total_sum_squares else 0.0
+    return {
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(np.mean(np.abs(errors))),
+        "r_squared": r_squared,
     }
 
-    for name, load_func in datasets.items():
-        try:
-            X, y = load_func()
-            print(f"Dataset: {name}, Features shape: {X.shape}, Target shape: {y.shape}")
-            # Train autoencoder on the features
-            autoencoder = train_autoencoder(X, hidden_dim=2, epochs=1000, learning_rate=0.01)
-            print(f"Autoencoder trained on {name} dataset.")
-        except Exception as e:
-            print(f"Error processing dataset {name}: {e}")
 
-    
+#Use this for the 5x2
+#You'll get it
 
-    
+def run_experiment_split(
+    dataset_name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    train_indices: np.ndarray,
+    test_indices: np.ndarray,
+    epochs: int = 100,
+    learning_rate: float = 0.01,
+    hidden_sizes: tuple[int, int] | None = None,
+    encoder_dim: int | None = None,
+    seed: int = 447,
+) -> list[dict[str, str | int | float]]:
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    train_indices = np.asarray(train_indices, dtype=int)
+    test_indices = np.asarray(test_indices, dtype=int)
+    if train_indices.size == 0 or test_indices.size == 0:
+        raise ValueError("Both training and test splits must contain samples")
+    if np.intersect1d(train_indices, test_indices).size:
+        raise ValueError("no overlap allowed")
+    if (
+        np.any(train_indices < 0)
+        or np.any(test_indices < 0)
+        or np.any(train_indices >= X.shape[0])
+        or np.any(test_indices >= X.shape[0])
+    ):
+        raise IndexError("out of bounds")
+    X_train_raw, X_test_raw = X[train_indices], X[test_indices]
+    y_train, y_test = y[train_indices], y[test_indices]
+    is_classification = y.ndim == 2 and y.shape[1] > 1
+
+    preprocessor = DatasetLoaderPreprocessor()
+    X_train = preprocessor.fit_transform_features(X_train_raw)
+    X_test = preprocessor.transform_features(X_test_raw)
+
+    if is_classification:
+        train_targets = y_train
+        is_softmax = True
+        is_cross_entropy = True
+        target_mean = np.zeros((1, y.shape[1]))
+        target_scale = np.ones((1, y.shape[1]))
+    else:
+        target_mean = y_train.mean(axis=0, keepdims=True)
+        target_scale = y_train.std(axis=0, keepdims=True)
+        target_scale[target_scale == 0.0] = 1.0
+        train_targets = (y_train - target_mean) / target_scale
+        is_softmax = False
+        is_cross_entropy = False
+
+    input_dim = X_train.shape[1]
+    output_dim = y.shape[1]
+    if hidden_sizes is None:
+        hidden1 = max(4, min(32, input_dim))
+        hidden2 = max(2, hidden1 // 2)
+    else:
+        hidden1, hidden2 = hidden_sizes
+        if hidden1 < 1 or hidden2 < 1:
+            raise ValueError("must be positive")
+    if encoder_dim is None:
+        encoder_dim = max(1, min(input_dim - 1, input_dim // 2))
+    if not 0 < encoder_dim < input_dim:
+        raise ValueError("out of bounds")
+
+    model_specs: list[tuple[str, NeuralNetwork]] = [
+        (
+            "linear_baseline",
+            NeuralNetwork(
+                [input_dim, output_dim],
+                use_softmax=is_softmax,
+                use_cel=is_cross_entropy,
+                seed=seed,
+            ),
+        ),
+        (
+            "two_hidden_layer",
+            NeuralNetwork(
+                [input_dim, hidden1, hidden2, output_dim],
+                use_softmax=is_softmax,
+                use_cel=is_cross_entropy,
+                seed=seed + 1,
+            ),
+        ),
+    ]
+
+    autoencoder = train_autoencoder(
+        X_train,
+        hidden_dim=encoder_dim,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        seed=seed + 2,
+    )
+    pretrained_model = NeuralNetwork(
+        [input_dim, encoder_dim, hidden2, output_dim],
+        use_softmax=is_softmax,
+        use_cel=is_cross_entropy,
+        seed=seed + 3,
+    )
+    pretrained_model.weights[0] = autoencoder.model.weights[0].copy()
+    model_specs.append(("autoencoder_pretrained", pretrained_model))
+
+    results: list[dict[str, str | int | float]] = []
+    for model_index, (model_name, model) in enumerate(model_specs):
+        _fit_network(
+            model,
+            X_train,
+            train_targets,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            seed=seed + 10 + model_index,
+        )
+
+        train_predictions = _predict_network(model, X_train)
+        test_predictions = _predict_network(model, X_test)
+        if not is_classification:
+            train_predictions = train_predictions * target_scale + target_mean
+            test_predictions = test_predictions * target_scale + target_mean
+
+        row: dict[str, str | int | float] = {
+            "dataset": dataset_name,
+            "model": model_name,
+            "train_size": int(len(train_indices)),
+            "test_size": int(len(test_indices)),
+            "epochs": epochs,
+            "learning_rate": learning_rate,
+            "hidden1": hidden1 if model_name == "two_hidden_layer" else (
+                encoder_dim if model_name == "autoencoder_pretrained" else 0
+            ),
+            "hidden2": hidden2 if model_name != "linear_baseline" else 0,
+        }
+        row.update({
+            f"train_{metric}": value
+            for metric, value in _calculate_metrics(y_train, train_predictions, is_classification).items()
+        })
+        row.update({
+            f"test_{metric}": value
+            for metric, value in _calculate_metrics(y_test, test_predictions, is_classification).items()
+        })
+        results.append(row)
+
+    return results
+
+#You'll need to edit this to for the 5x2 and tests
+def experiment_runner(
+    data_dir: str = ".",
+    output_file: str = "experiment_results.csv",
+    test_fraction: float = 0.2,
+    epochs: int = 100,
+    learning_rate: float = 0.01,
+    seed: int = 447,
+) -> list[dict[str, str | int | float]]:
+    loader = DatasetLoaderPreprocessor(data_dir=data_dir)
+    all_results: list[dict[str, str | int | float]] = []
+
+    for dataset_index, (dataset_name, loader_method) in enumerate(DATASET_LOADERS.items()):
+        X, y = getattr(loader, loader_method)()
+        train_indices, test_indices = make_train_test_split(
+            y,
+            test_fraction=test_fraction,
+            seed=seed + dataset_index,
+        )
+        dataset_results = run_experiment_split(
+            dataset_name,
+            X,
+            y,
+            train_indices,
+            test_indices,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            seed=seed + dataset_index * 100,
+        )
+        all_results.extend(dataset_results)
+        for result in dataset_results:
+            metric_text = ", ".join(
+                f"{key}={value:.4f}"
+                for key, value in result.items()
+                if key.startswith("test_") and key != "test_size"
+            )
+            print(f"{dataset_name} | {result['model']} | {metric_text}")
+
+    output_path = Path(output_file)
+    if not output_path.is_absolute():
+        output_path = Path(__file__).resolve().parent / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(all_results).to_csv(output_path, index=False)
+    print(f"Saved results to {output_path}")
+    return all_results
 
 
 if __name__ == '__main__':
-    X_train = np.array([
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0],
-        [0.0, 0.0],
-    ])
-
-    AE = Autoencoder(input_dim=2, hidden_dim=1, learning_rate=0.001)
-    initial_reconstructions = np.array([AE.reconstruct(x).ravel() for x in X_train])
-    initial_mse = np.mean((initial_reconstructions - X_train) ** 2)
-    print("Initial reconstruction MSE:", initial_mse)
-
-    AE.train(X_train, epochs=1000)
-
-    reconstructions = np.array([AE.reconstruct(x).ravel() for x in X_train])
-    final_mse = np.mean((reconstructions - X_train) ** 2)
-    print("Final reconstruction MSE:", final_mse)
-    print("Encoded first sample:")
-    print(AE.encode(X_train[0]))
-    print("Reconstruction of first sample:")
-    print(AE.reconstruct(X_train[0]))
+    experiment_runner()
